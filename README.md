@@ -138,7 +138,7 @@ We will re-run `main.py` and evaluate on the fixed test set. BLEU (SacreBLEU) is
 4. **Reasonable Performance**: Achieve competitive BLEU given the chosen model and setup
 5. **Runtime**: Complete in a reasonable time budget (≤ 12 hours with **ONE GPU on HKU GPU Farm**)
 
-**BLEU-based Grading (dummy thresholds, subject to adjustment):**
+**BLEU-based Grading:**
 
 - **BLEU ≥ 25**: 100%
 - **BLEU ≥ 24**: 90%
