@@ -18,8 +18,7 @@ def create_training_arguments() -> Seq2SeqTrainingArguments:
 
     Режим "inference only":
     - train() ничего не делает (см. InferenceOnlyTrainer),
-    - аргументы нужны только для корректной работы evaluate(),
-    - дополнительно ограничиваем длину генерации, чтобы не ловить OOM.
+    - аргументы нужны только для корректной работы evaluate().
     """
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
@@ -49,15 +48,15 @@ def create_training_arguments() -> Seq2SeqTrainingArguments:
 
         max_grad_norm=1.0,
 
-        # Мы САМИ будем вызывать generate() в кастомной evaluate,
-        # так что этот флаг Trainer'а нам не важен, но пусть будет.
+        # predict_with_generate Trainer'у по сути не нужен,
+        # т.к. мы делаем свою evaluate(), но пусть будет.
         predict_with_generate=True,
 
         # Для 3.3B-модели: fp16, чтобы влезть в память
         fp16=True,
         gradient_accumulation_steps=1,
 
-        # ВАЖНО: gradient_checkpointing выключен, чтобы не было сигнатурных багов.
+        # gradient_checkpointing выключен, чтобы не ловить странные баги.
         gradient_checkpointing=False,
 
         dataloader_num_workers=4,
@@ -68,9 +67,11 @@ def create_training_arguments() -> Seq2SeqTrainingArguments:
         # Хотим видеть прогресс, если надо
         disable_tqdm=False,
 
-        # 🔥 Ограничиваем длину и отключаем beam search по умолчанию.
-        generation_max_length=64,
-        generation_num_beams=1,
+        # Эти поля не используются в нашей кастомной evaluate,
+        # но оставим их "разумными", на случай если кто-то вызовет
+        # стандартный evaluate() без переопределения.
+        generation_max_length=256,
+        generation_num_beams=4,
     )
 
     return training_args
@@ -87,20 +88,28 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
     """
     Trainer, который:
       - полностью пропускает обучение,
-      - использует КАСТОМНЫЙ, легкий по памяти evaluation-loop,
+      - использует КАСТОМНЫЙ, лёгкий по памяти evaluation-loop,
         вместо стандартного Trainer.evaluate() + Accelerate.
     """
 
     def train(self, *args, **kwargs):
+        # "Фиктивное" обучение: просто ставим модель в eval-режим.
         self.model.eval()
         return None
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
         """
-        Кастомная реализация evaluate, похожая на твой скрипт:
-        - простой DataLoader
-        - ручной вызов model.generate(...)
-        - потом compute_metrics(...)
+        Кастомная реализация evaluate, ближе к прошлому multi_model_eval:
+
+        - простой DataLoader (без Accelerate),
+        - model.generate(...) с параметрами, которые мы
+          использовали для facebook/nllb-200-3.3B:
+            * max_new_tokens=128
+            * num_beams=4
+            * do_sample=False
+            * no_repeat_ngram_size=3
+            * early_stopping=True
+        - затем compute_metrics(...) из evaluation.py
         """
 
         # Выбираем датасет: если явно передали, используем его, иначе self.eval_dataset
@@ -111,7 +120,7 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
         self.model.to(device)
         self.model.eval()
 
-        # 🔧 ВАЖНО: удаляем 'translation' из фичей перед collate,
+        # 🔧 Удаляем 'translation' перед collate,
         # иначе DataCollatorForSeq2Seq ломается на nested dict.
         def collate_fn(features):
             if "translation" in features[0]:
@@ -132,6 +141,7 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
 
         # Простой цикл без Accelerate
         for batch in dataloader:
+            # labels остаются на CPU
             labels = batch["labels"].clone()
             all_labels.append(labels)
 
@@ -139,14 +149,22 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
             attention_mask = batch["attention_mask"].to(device)
 
             with torch.no_grad():
+                # ❗ ПАРАМЕТРЫ ГЕНЕРАЦИИ, МАКСИМАЛЬНО БЛИЗКИЕ
+                # К ПРОШЛОМУ multi_model_eval
                 generated_tokens = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_length=self.args.generation_max_length or 64,
-                    num_beams=self.args.generation_num_beams or 1,
+                    max_new_tokens=128,
+                    num_beams=4,
+                    do_sample=False,
+                    no_repeat_ngram_size=3,
+                    early_stopping=True,
                 )
 
             all_preds.append(generated_tokens.cpu())
+
+        if not all_preds:
+            return {}
 
         # ==== ПАДДИНГ ПЕРЕД КОНКАТЕНАЦИЕЙ ====
         pad_token_id = self.tokenizer.pad_token_id or 0
@@ -167,7 +185,8 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
             padded_preds.append(t)
         preds_tensor = torch.cat(padded_preds, dim=0)
 
-        # Лейблы: паддим ignore_index (-100)
+        # Лейблы: паддим ignore_index (-100),
+        # как это делает HuggingFace Trainer.
         max_label_len = max(t.size(1) for t in all_labels)
         padded_labels = []
         for t in all_labels:
