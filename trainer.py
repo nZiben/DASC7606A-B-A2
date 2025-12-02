@@ -1,5 +1,3 @@
-# trainer.py
-
 import torch
 from torch.utils.data import DataLoader
 from transformers import (
@@ -18,14 +16,15 @@ def create_training_arguments() -> Seq2SeqTrainingArguments:
 
     Режим "inference only":
     - train() ничего не делает (см. InferenceOnlyTrainer),
-    - аргументы нужны только для корректной работы evaluate().
+    - аргументы нужны только для корректной работы evaluate(),
+    - дополнительно задаём параметры генерации.
     """
     training_args = Seq2SeqTrainingArguments(
         output_dir=OUTPUT_DIR,
 
-        # Тренировки не будет, но Trainer всё равно просит эти параметры.
+        # Обучения по сути нет, но Trainer требует эти поля:
         num_train_epochs=1,
-        max_steps=0,  # фактически "нет шагов обучения"
+        max_steps=0,  # "нет шагов обучения"
 
         per_device_train_batch_size=1,
         per_device_eval_batch_size=1,
@@ -37,7 +36,7 @@ def create_training_arguments() -> Seq2SeqTrainingArguments:
         logging_steps=1,
         save_steps=50,
 
-        # В процессе "обучения" валидацию не гоняем
+        # В процессе "обучения" валидацию не запускаем
         evaluation_strategy="no",
 
         save_total_limit=1,
@@ -47,30 +46,19 @@ def create_training_arguments() -> Seq2SeqTrainingArguments:
         greater_is_better=True,
 
         max_grad_norm=1.0,
-
-        # predict_with_generate Trainer'у по сути не нужен,
-        # т.к. мы делаем свою evaluate(), но пусть будет.
         predict_with_generate=True,
 
-        # Для 3.3B-модели: fp16, чтобы влезть в память
+        # Для большой модели — fp16
         fp16=True,
         gradient_accumulation_steps=1,
-
-        # gradient_checkpointing выключен, чтобы не ловить странные баги.
         gradient_checkpointing=False,
 
         dataloader_num_workers=4,
+        report_to="none",      # без wandb и т.п.
+        disable_tqdm=False,    # пусть прогрессбар Trainer'а живёт, если вдруг пригодится
 
-        # Чтобы Trainer не пытался логировать в WandB и т.п.
-        report_to="none",
-
-        # Хотим видеть прогресс, если надо
-        disable_tqdm=False,
-
-        # Эти поля не используются в нашей кастомной evaluate,
-        # но оставим их "разумными", на случай если кто-то вызовет
-        # стандартный evaluate() без переопределения.
-        generation_max_length=256,
+        # Параметры генерации по умолчанию
+        generation_max_length=128,
         generation_num_beams=4,
     )
 
@@ -88,31 +76,27 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
     """
     Trainer, который:
       - полностью пропускает обучение,
-      - использует КАСТОМНЫЙ, лёгкий по памяти evaluation-loop,
-        вместо стандартного Trainer.evaluate() + Accelerate.
+      - использует кастомный evaluation-loop с явным generate()
+        и padding, чтобы без ошибок считать BLEU на test.
     """
 
     def train(self, *args, **kwargs):
-        # "Фиктивное" обучение: просто ставим модель в eval-режим.
+        # "Псевдо-обучение" — просто ставим модель в eval-режим.
         self.model.eval()
         return None
 
     def evaluate(self, eval_dataset=None, ignore_keys=None, metric_key_prefix: str = "eval"):
         """
-        Кастомная реализация evaluate, ближе к прошлому multi_model_eval:
-
-        - простой DataLoader (без Accelerate),
-        - model.generate(...) с параметрами, которые мы
-          использовали для facebook/nllb-200-3.3B:
-            * max_new_tokens=128
-            * num_beams=4
-            * do_sample=False
-            * no_repeat_ngram_size=3
-            * early_stopping=True
-        - затем compute_metrics(...) из evaluation.py
+        Кастомная реализация evaluate:
+        - простой DataLoader,
+        - ручной вызов model.generate(...)
+        - padding предсказаний и лейблов до одинаковой длины,
+        - вызов compute_metrics из evaluation.py.
         """
 
-        # Выбираем датасет: если явно передали, используем его, иначе self.eval_dataset
+        # Если датасет явно не передали, берём сохранённый (validation).
+        # main.py передаёт сюда tokenized_datasets["test"], так что
+        # для финального BLEU реально используется test.
         if eval_dataset is None:
             eval_dataset = self.eval_dataset
 
@@ -120,8 +104,7 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
         self.model.to(device)
         self.model.eval()
 
-        # 🔧 Удаляем 'translation' перед collate,
-        # иначе DataCollatorForSeq2Seq ломается на nested dict.
+        # Удаляем "translation" перед collate, иначе DataCollatorForSeq2Seq ломается.
         def collate_fn(features):
             if "translation" in features[0]:
                 features = [
@@ -139,9 +122,12 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
         all_preds = []
         all_labels = []
 
-        # Простой цикл без Accelerate
+        # Параметры генерации, близкие к тем, что мы использовали в multi_model_eval
+        gen_max_length = self.args.generation_max_length or 128
+        gen_num_beams = self.args.generation_num_beams or 8
+
         for batch in dataloader:
-            # labels остаются на CPU
+            # Сохраняем labels до того, как уйдут на устройство
             labels = batch["labels"].clone()
             all_labels.append(labels)
 
@@ -149,22 +135,17 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
             attention_mask = batch["attention_mask"].to(device)
 
             with torch.no_grad():
-                # ❗ ПАРАМЕТРЫ ГЕНЕРАЦИИ, МАКСИМАЛЬНО БЛИЗКИЕ
-                # К ПРОШЛОМУ multi_model_eval
                 generated_tokens = self.model.generate(
                     input_ids=input_ids,
                     attention_mask=attention_mask,
-                    max_new_tokens=128,
-                    num_beams=4,
+                    max_length=gen_max_length,
+                    num_beams=gen_num_beams,
                     do_sample=False,
                     no_repeat_ngram_size=3,
                     early_stopping=True,
                 )
 
             all_preds.append(generated_tokens.cpu())
-
-        if not all_preds:
-            return {}
 
         # ==== ПАДДИНГ ПЕРЕД КОНКАТЕНАЦИЕЙ ====
         pad_token_id = self.tokenizer.pad_token_id or 0
@@ -185,8 +166,7 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
             padded_preds.append(t)
         preds_tensor = torch.cat(padded_preds, dim=0)
 
-        # Лейблы: паддим ignore_index (-100),
-        # как это делает HuggingFace Trainer.
+        # Лейблы: паддим ignore_index (-100)
         max_label_len = max(t.size(1) for t in all_labels)
         padded_labels = []
         for t in all_labels:
@@ -205,10 +185,10 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
         preds_np = preds_tensor.numpy()
         labels_np = labels_tensor.numpy()
 
-        # Используем заданный в задании compute_metrics (НЕ меняем его)
+        # Используем compute_metrics из evaluation.py (его менять нельзя)
         metrics = compute_metrics((preds_np, labels_np), self.tokenizer)
 
-        # Префиксуем ключи, как делает Trainer (test_bleu, eval_bleu и т.п.)
+        # Префиксуем ключи (получишь test_bleu, если metric_key_prefix="test")
         metrics = {f"{metric_key_prefix}_{k}": v for k, v in metrics.items()}
 
         return metrics
