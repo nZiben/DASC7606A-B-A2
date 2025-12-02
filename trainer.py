@@ -92,7 +92,6 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
     """
 
     def train(self, *args, **kwargs):
-        print(">>> Skipping training: inference-only mode (no gradient updates).")
         self.model.eval()
         return None
 
@@ -103,7 +102,6 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
         - ручной вызов model.generate(...)
         - потом compute_metrics(...)
         """
-        print(">>> Running custom low-memory evaluation loop...")
 
         # Выбираем датасет: если явно передали, используем его, иначе self.eval_dataset
         if eval_dataset is None:
@@ -194,7 +192,6 @@ class InferenceOnlyTrainer(Seq2SeqTrainer):
         # Префиксуем ключи, как делает Trainer (test_bleu, eval_bleu и т.п.)
         metrics = {f"{metric_key_prefix}_{k}": v for k, v in metrics.items()}
 
-        print(">>> Evaluation finished.")
         return metrics
 
 
